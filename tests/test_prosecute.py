@@ -531,28 +531,70 @@ def test_prosecute_stays_well_under_the_five_second_deadline_even_on_a_large_tra
     assert result["v"] == 1
 
 
-def test_starter_end_to_end_against_the_full_fixture_set(labelled_fixtures):
+def test_completed_prosecutor_end_to_end_against_the_full_fixture_set(labelled_fixtures):
+    """The whole prosecutor, all 17 detectors, against all 40 labelled traces.
+
+    WHAT THIS ASSERTS NOW, AND WHAT IT USED TO
+    -------------------------------------------
+    This test previously PINNED the starter's incompleteness: `0.0 < recall <
+    0.15`, and `claimed == 0` for all 16 classes that were still `return []`
+    stubs. Both were correct statements about a file where one of seventeen
+    detectors existed, and both are bugs the moment the other sixteen are
+    written -- they assert the ABSENCE of the assignment. Implementing Task 2
+    necessarily breaks them, so they are gone rather than relaxed.
+
+    What replaces them is a real regression guard on the finished prosecutor,
+    pinning the shape that actually matters in a duel:
+
+      * `recall >= 0.85` -- the achieved floor. Measured at 1.000 (34 of 34 real
+        defects verified) when this was written; the floor sits below that so a
+        single detector regressing fails loudly here rather than silently
+        halving one class's score.
+      * `precision == 1.0` and `false == 0` -- nothing is filed against a class a
+        trace does not contain. This is the number with teeth: CONTRACTS.md
+        section 6.2 charges `-0.8 * weight` for a false claim, so a prosecutor
+        that trades precision for recall loses points on average.
+      * `unproven == 0` -- every claim cites the ground truth's FULL proof set.
+        This is what the near-miss fixtures exist to test: an `unproven` here
+        means a detector took the obvious decoy instead of the real evidence.
+      * `rejected == 0` -- `ProsecutionBudget` makes a schema-invalid or
+        over-quota claim structurally impossible, so any rejection is a bug in
+        the caller, not a detection miss.
+      * `n_errors == 0` / `n_timeouts == 0` -- `prosecute` never raises and stays
+        far under the 5 s deadline on every fixture.
+      * Per class: both fixtures verified, on all seventeen. A `recall` of 0.50
+        on any single class means its positive trace landed and its near-miss
+        did not -- the exact failure the decoy is designed to cause.
+    """
     report = score_prosecutor(prosecute, labelled_fixtures)
 
     assert report["n_fixtures"] == len(labelled_fixtures)
-    assert report["n_errors"] == 0
-    assert report["n_timeouts"] == 0
-    assert report["false"] == 0, "the starter's one detector must never file a false claim on this fixture set"
-    assert report["rejected"] == 0, "the starter must never emit a schema-invalid or over-quota claim on its own"
+    assert report["n_errors"] == 0, f"prosecute() must never raise on a valid fixture: {report['errors']}"
+    assert report["n_timeouts"] == 0, f"prosecute() must stay far under the 5s deadline: {report['slow']}"
+    assert report["false"] == 0, "no detector may file a claim on a class the fixture does not contain"
+    assert report["rejected"] == 0, "ProsecutionBudget must make a schema-invalid or over-quota claim impossible"
+    assert report["unproven"] == 0, (
+        "every claim must cite the ground truth's full proof set -- an unproven claim means a detector "
+        "cited the near-miss decoy instead of the real evidence"
+    )
 
     # precision perfect: it never guesses wrong when it does file
     assert report["precision"] == 1.0
-    # recall low: it implements exactly 1 of 17 classes
-    assert 0.0 < report["recall"] < 0.15
+    # recall: all 17 classes implemented. Measured 1.000; the floor guards regressions.
+    assert report["recall"] >= 0.85
     assert report["false_claim_rate"] == 0.0
+    assert report["f1"] >= 0.85
 
-    assert report["per_class"]["enforcement_failure"]["recall"] == 1.0
-    assert report["per_class"]["enforcement_failure"]["present"] == 2
-    assert report["per_class"]["enforcement_failure"]["verified"] == 2
-    # every other class: present in the fixtures, but never claimed (stub hooks)
-    for cls in CLASSES - {"enforcement_failure"}:
-        assert report["per_class"][cls]["present"] >= 2
-        assert report["per_class"][cls]["claimed"] == 0
+    # every class, both of its fixtures (positive AND near_miss), verified.
+    for cls in CLASSES:
+        stats = report["per_class"][cls]
+        assert stats["present"] == 2, f"{cls}: one positive + one near_miss expected, got {stats['present']}"
+        assert stats["false"] == 0, f"{cls}: filed a false claim somewhere in the fixture set"
+        assert stats["unproven"] == 0, f"{cls}: cited the decoy on one of its fixtures"
+        assert stats["recall"] == 1.0, (
+            f"{cls}: must be verified on BOTH fixtures, got recall={stats['recall']:.2f} "
+            "-- 0.50 means the near-miss decoy was cited instead of the real proof"
+        )
 
 
 def test_starter_files_nothing_on_clean_fixtures(labelled_fixtures):

@@ -15,11 +15,11 @@ ways to spend a single round, both real, both computed against
 them live rather than just asserting the numbers, so they can never
 silently drift from the real cost table):
 
-    DISCIPLINED  slides.query(fields=[title,body])   base1 + (body3+title1) + 1row*1  =  6
-                 slides.get_frame(default fields)     base2 + (body2+title0)          =  4
+    DISCIPLINED  slides.query(fields=[title,body])   base1 + (body2+title0) + 1row*1  =  4
+                 slides.get_frame(default fields)     base2 + (body+title = 2)        =  4
                  registry.provenance(default fields)  base1 + (etag0)                 =  1
                  -------------------------------------------------------
-                 = 11 credits this round — the CEILING of FINAL-PLAN.md 4.3's
+                 = 9 credits this round — the CEILING of FINAL-PLAN.md 4.3's
                    "8-11" (a round that skips the provenance re-read, or
                    reuses a cached body via `ResultCache` below, lands
                    nearer the floor of that range instead).
@@ -32,14 +32,21 @@ silently drift from the real cost table):
                  = 49 credits — MORE THAN ONE THIRD OF THE WHOLE DUEL'S
                    BUDGET, spent in a single round.
 
-Play at the DISCIPLINED CEILING (11 cr) every single round and 10 rounds
-costs 110 — a hair OVER the 100-credit pool: this file's own `__main__`
-demo shows that combination surviving nine full rounds and only running dry
-paying for the tenth. That is not a bug in the arithmetic; it is the honest
-point — "disciplined" is not a magic number, it is not re-paying for the
-same provenance read or the same frame body every round when you already
-have it (`ResultCache` below, and `BudgetPacer.is_affordable`'s reserve
-floor). Play CARELESS even once and you are mathematically bankrupt by
+Play at the DISCIPLINED CEILING every single round and 10 rounds cost 90 of
+the 100-credit pool — 10 credits of margin for the whole duel, and not one
+more. (That margin exists because `kit/mcp/specs.py`'s own D-10 FIX retuned
+`slides.query` for exactly this reason: at the 11 cr this file used to
+quote, ten disciplined rounds cost 110 and the pool was structurally
+unplayable. This module's `__main__` demo recomputes the number live rather
+than trusting this prose, which is how the retune was noticed at all.) Ten
+credits is not slack you can spend twice: one careless catalog read (12 cr)
+already exceeds it, and CONTRACTS.md 4.1 charges 2 cr for every malformed
+`Decision` or blown deadline on top. "Disciplined" is therefore not a magic
+number — it is not re-paying for the same provenance read or the same frame
+body every round when you already have it (`ResultCache` below, and
+`BudgetPacer.is_affordable`'s reserve floor, whose flat reserve
+`reserve_for_round` below replaces with a round-aware one). Play CARELESS
+even once and you are mathematically bankrupt by
 round 3 (100 − 49 − 49 < 0) — not because the game is rigged against you,
 but because `registry.list_servers` and `glossary.list_terms` were
 deliberately built so their DEFAULT field mask is their full, expensive
@@ -88,12 +95,18 @@ except ImportError:  # pragma: no cover - collaborator file
 __all__ = [
     "ROUNDS_PER_DUEL",
     "SAFE_STARTING_RESERVE",
+    "MIN_VIABLE_ROUND_COST",
+    "ROUND_ALLOWANCE",
     "CATALOG_TRAP_TOOLS",
     "DEPRECATED_SUCCESSORS",
+    "NARROW_MASKS",
     "disciplined_round_cost",
     "careless_round_cost",
     "is_catalog_trap",
     "cheap_mask",
+    "narrow_mask",
+    "estimated_cost",
+    "reserve_for_round",
     "successor_of",
     "BudgetPacer",
     "ReplicaChoice",
@@ -111,6 +124,38 @@ ROUNDS_PER_DUEL = 10
 # as its one, deliberately simple, heuristic.
 SAFE_STARTING_RESERVE = 0.5  # keep at least half the ORIGINAL pool as a floor
 
+# The cheapest round that can still GROUND an answer: one `slides.query` to
+# locate (2 cr) plus one `registry.provenance` to pin (1 cr), with 2 cr of
+# slack for the arena's own error penalties (CONTRACTS.md 4.1 charges 2 cr
+# for a malformed Decision or a blown deadline). Below this a round cannot
+# cite anything it has actually retrieved, which is `ungrounded` (weight 5)
+# and `non_responsive` (weight 4) bought with the credits you saved. This is
+# the floor `reserve_for_round` protects for every round STILL TO COME.
+MIN_VIABLE_ROUND_COST = 5
+
+# Per-round CREDIT allowance, and the reason it is NOT flat.
+#
+# Damage in a duel is scaled by the round: x1.0 for rounds 1-3, x1.25 for
+# 4-7, x1.5 for 8-10 (spar.py's `round_scale`, mirroring the arena's). A
+# credit that buys a grounded citation in round 9 therefore prevents 1.5x
+# the damage the same credit prevents in round 2 — so spending the 100-credit
+# pool EVENLY is a measurable mistake, not merely an aesthetic one. The table
+# below back-loads the pool deliberately and sums to exactly 100:
+#
+#     rounds 1-3   9 cr each  = 27   (x1.0  — the cheap rounds, played lean)
+#     rounds 4-7  10 cr each  = 40   (x1.25 — the disciplined round's price)
+#     rounds 8-10 11 cr each  = 33   (x1.5  — where a credit is worth most)
+#
+# It is an allowance, not a quota: what a round does not spend stays in
+# `GatewayContext.credits` and is available to every round after it, which
+# is exactly what makes underspending early a real strategy rather than a
+# missed opportunity.
+ROUND_ALLOWANCE: Mapping[int, int] = {
+    1: 9, 2: 9, 3: 9,
+    4: 10, 5: 10, 6: 10, 7: 10,
+    8: 11, 9: 11, 10: 11,
+}
+
 # The two named "punishment button" tools (FINAL-PLAN.md 4.1): their
 # DEFAULT field mask is their full, most expensive dump, not a cheap
 # starting point. Calling either with no `fields=` is never an accident
@@ -125,6 +170,44 @@ CATALOG_TRAP_TOOLS: frozenset[tuple[str, str]] = frozenset(
 # look a tool up without re-deriving deprecation from `TOOL_SPECS` by hand.
 DEPRECATED_SUCCESSORS: Mapping[tuple[str, str], tuple[str, str]] = {
     ("slides", "search"): ("slides", "query"),
+}
+
+# The mask this team actually sends when the model named none — one row per
+# tool, chosen as "the fields an answer of this ask type would genuinely
+# cite", not as "the fields that exist". Every entry below is validated
+# against `kit.mcp.specs.TOOL_SPECS.all_fields` by this module's own
+# `__main__` demo, so a retune of the economy (or a typo here) fails loudly
+# in `python -m agent.strategy` rather than as a mid-duel `KeyError` inside
+# `cost_of`.
+#
+# Two entries earn their place more than the rest, because they are the
+# FINAL-PLAN.md 4.1 "punishment buttons" whose DEFAULT mask is their full
+# dump (see `CATALOG_TRAP_TOOLS`):
+#
+#     registry.list_servers   default 12 cr -> ("name",)  2 cr
+#     glossary.list_terms     default 10 cr -> ("term",)  2 cr
+#
+# `glossary.list_terms` narrows to bare `("term",)` on purpose: browsing a
+# catalog is a question about WHICH TERMS EXIST. If you want a definition,
+# `glossary.define` answers that for 1 credit — paying 10 to have every
+# definition dumped so you can read one of them is the exact shape of the
+# `wasteful` class.
+NARROW_MASKS: Mapping[tuple[str, str], tuple[str, ...]] = {
+    ("slides", "query"): ("title",),
+    ("slides", "get_frame"): ("body", "title"),
+    ("slides", "whatlinkshere"): ("targets",),
+    ("slides", "search"): ("anchor", "title"),  # only reachable pre-rewrite
+    ("glossary", "define"): ("definition",),
+    ("glossary", "list_terms"): ("term",),
+    ("registry", "provenance"): ("etag", "rev"),
+    ("registry", "list_servers"): ("name",),
+    ("research", "cite_source"): ("anchor", "url"),
+    ("labs", "get_exercise"): ("summary",),
+    ("progress", "record_mastery"): ("receipt_id",),
+    ("content", "flag_stale_slide"): ("receipt_id",),
+    ("curriculum-analyst", "which_days_cover"): ("anchor", "course_day", "track"),
+    ("citation-checker", "verify_source"): ("anchor", "url"),
+    ("roster", "lookup_learner"): ("act", "scopes"),
 }
 
 
@@ -188,6 +271,127 @@ def successor_of(server: str, tool: str) -> tuple[str, str] | None:
     and removes the `wasteful` "used a deprecated tool" detector hit
     (CONTRACTS.md 6.4) entirely."""
     return DEPRECATED_SUCCESSORS.get((server, tool))
+
+
+def _all_fields(server: str, tool: str) -> tuple[str, ...] | None:
+    """Every field `(server, tool)` can legally be asked for, or `None` when
+    the tool is unknown to `kit.mcp.specs` (or the specs module is degraded).
+    Used to SANITISE a mask before pricing it — `kit.mcp.specs.cost_of`
+    raises `KeyError` on a field the tool does not have, and `Gateway.decide`
+    is forbidden from raising, so an unknown field must be dropped here
+    rather than blown up on downstream."""
+    if not _SPECS_AVAILABLE:
+        return None
+    spec = TOOL_SPECS.get((server, tool))
+    return tuple(getattr(spec, "all_fields", ())) if spec is not None else None
+
+
+def narrow_mask(server: str, tool: str, requested: tuple[str, ...]) -> tuple[str, ...]:
+    """The mask a BUDGET job should actually forward for `(server, tool)`.
+
+    Three cases, in order, and the middle one is the whole point:
+
+      1. The caller named nothing (`()`) or asked for everything (`("*",)`)
+         — that is not a mask, it is a decision to pay the tool's default,
+         which for `registry.list_servers` and `glossary.list_terms` IS the
+         full dump (`CATALOG_TRAP_TOOLS`). Substitute this team's own narrow
+         default from `NARROW_MASKS`, falling back to the spec's
+         `default_fields` for a tool nobody listed.
+      2. The caller named real fields — RESPECT THEM. A mask the model chose
+         is the model saying "these are the fields my answer will cite", and
+         second-guessing it here is how a gateway ends up `ungrounded`
+         (weight 5) for a field the answer needed and never received. Only
+         fields the tool does not actually have are dropped, and only because
+         pricing them would raise.
+      3. Sanitising emptied the mask (every named field was bogus) — fall
+         back to case 1's narrow default rather than sending `()`, which
+         would silently re-select the tool's expensive default.
+
+    Never raises. `cheap_mask` above is the version that DOES raise on an
+    unknown tool, which is the right behaviour when a human is choosing a
+    mask by hand and the wrong behaviour inside `Gateway.decide`."""
+    fallback = NARROW_MASKS.get((server, tool))
+    if fallback is None and _SPECS_AVAILABLE:
+        spec = TOOL_SPECS.get((server, tool))
+        fallback = tuple(getattr(spec, "default_fields", ())) if spec is not None else ()
+    fallback = tuple(fallback or ())
+
+    asked = tuple(requested or ())
+    if not asked or asked == ("*",):
+        return fallback
+
+    legal = _all_fields(server, tool)
+    if legal is None:
+        # Specs degraded or unknown tool: we cannot tell a real field from a
+        # typo, so pass the caller's mask through untouched rather than
+        # inventing a narrowing we cannot justify.
+        return tuple(sorted(set(asked)))
+    kept = tuple(sorted({f for f in asked if f in legal}))
+    return kept or fallback
+
+
+#: What an unpriceable call is assumed to cost. Higher than the disciplined
+#: round's ~3 cr per-call average on purpose: "I don't know" should make the
+#: pacer more careful, never less.
+_UNKNOWN_TOOL_COST = 6
+
+
+def estimated_cost(
+    server: str, tool: str, fields: tuple[str, ...] = (), n_rows: int = 1
+) -> int:
+    """What forwarding this call is expected to cost, in credits, priced off
+    the real `kit.mcp.specs` table when it is importable and off this
+    module's degraded anchor table when it is not.
+
+    NEVER RAISES — that is the entire reason this wrapper exists rather than
+    calling `kit.mcp.specs.cost` directly from `Gateway.decide`. `cost_of`
+    raises `KeyError` for an unknown tool or an unknown field in the mask,
+    and a raised exception inside `decide()` is charged as a denied command
+    PLUS 2 credits PLUS a scored `integrity` event (CONTRACTS.md 4.1). An
+    honest over-estimate is strictly cheaper than an exception: when pricing
+    fails we return `_UNKNOWN_TOOL_COST`, which is deliberately above the
+    disciplined round's per-call average so a mispriced call is held back by
+    the pacer rather than waved through."""
+    try:
+        return int(_spec_cost(server, tool, tuple(fields or ()), n_rows))
+    except Exception:
+        # Retry once with the mask sanitised — the common failure is one
+        # bogus field name, not an unknown tool.
+        try:
+            return int(_spec_cost(server, tool, narrow_mask(server, tool, tuple(fields or ())), n_rows))
+        except Exception:
+            return _UNKNOWN_TOOL_COST
+
+
+def reserve_for_round(round_no: int, *, starting_pool: int = 100) -> float:
+    """The fraction of the ORIGINAL pool that must survive this round —
+    `BudgetPacer.is_affordable`'s `reserve` argument, made round-aware.
+
+    `SAFE_STARTING_RESERVE`'s flat 0.5 is the thing `BudgetPacer.is_affordable`'s
+    own docstring warns about: "by round 8-10 you know your real remaining
+    need better than a flat reserve does... over-cautious late". A flat 50%
+    floor means round 10 — the round whose credits are worth 1.5x — cannot
+    spend the credits it saved, which converts good pacing into unspent
+    budget at the exact moment budget is worth most.
+
+    So the reserve DECAYS with the rounds still to come: keep
+    `MIN_VIABLE_ROUND_COST` credits for each round after this one, and
+    nothing more.
+
+        round  1 -> 9 rounds left x 5 cr = 45 cr = 0.45 of the pool
+        round  5 -> 5 rounds left x 5 cr = 25 cr = 0.25
+        round 10 -> 0 rounds left        =  0 cr = 0.00  (spend it all)
+
+    Clamped into [0.0, 1.0] and tolerant of a nonsense `round_no` (the arena
+    owns that number; this function must not be the thing that breaks when
+    it is surprising)."""
+    if not isinstance(round_no, int) or isinstance(round_no, bool):
+        round_no = 1
+    bounded = max(1, min(round_no, ROUNDS_PER_DUEL))
+    rounds_left = ROUNDS_PER_DUEL - bounded
+    if starting_pool <= 0:
+        return 0.0
+    return max(0.0, min(1.0, (rounds_left * MIN_VIABLE_ROUND_COST) / float(starting_pool)))
 
 
 @dataclass
@@ -396,6 +600,53 @@ if __name__ == "__main__":
     assert succ == ("slides", "query")
     assert successor_of("slides", "query") is None
 
+    print("\n=== NARROW_MASKS: every entry is a mask the real economy accepts ===\n")
+    if _SPECS_AVAILABLE:
+        for (srv, tl), msk in sorted(NARROW_MASKS.items()):
+            spec = TOOL_SPECS.get((srv, tl))
+            assert spec is not None, f"NARROW_MASKS names an unknown tool: {srv}.{tl}"
+            bogus = [f for f in msk if f not in spec.all_fields]
+            assert not bogus, f"{srv}.{tl}: {bogus} are not fields of this tool"
+        print(f"  all {len(NARROW_MASKS)} narrow masks validate against TOOL_SPECS.all_fields")
+        # The two punishment buttons, priced both ways — the single most
+        # valuable number in this file.
+        for srv, tl in sorted(CATALOG_TRAP_TOOLS):
+            full = estimated_cost(srv, tl, ())
+            narrow = estimated_cost(srv, tl, NARROW_MASKS[(srv, tl)])
+            print(f"  {srv}.{tl}: default {full:>2} cr -> narrow {NARROW_MASKS[(srv, tl)]} {narrow:>2} cr")
+            assert narrow < full, (srv, tl, narrow, full)
+            assert narrow <= 3, (srv, tl, narrow)
+    else:
+        print("  kit.mcp.specs unavailable — mask validation skipped (degraded mode)")
+
+    print("\n=== narrow_mask / estimated_cost: neither may ever raise ===\n")
+    # 1. no mask named -> this team's narrow default, never the tool's own
+    assert narrow_mask("registry", "list_servers", ()) == ("name",)
+    assert narrow_mask("registry", "list_servers", ("*",)) == ("name",)
+    # 2. a real mask the model chose is respected, not second-guessed
+    assert narrow_mask("slides", "query", ("body", "title")) == ("body", "title")
+    # 3. a bogus field is dropped rather than priced (cost_of would KeyError)
+    assert narrow_mask("slides", "query", ("title", "anchor")) == ("title",)
+    # 4. an ALL-bogus mask falls back rather than degrading to the tool default
+    assert narrow_mask("slides", "query", ("nope",)) == ("title",)
+    print(f"  narrow_mask('slides','query',('title','anchor')) -> {narrow_mask('slides', 'query', ('title', 'anchor'))}"
+          f"   ('anchor' is not a slides.query field)")
+    for bad in (("registry", "no_such_tool", ()), ("slides", "query", ("anchor",)), ("", "", ("*",))):
+        got = estimated_cost(*bad)
+        print(f"  estimated_cost{bad} -> {got} cr (no exception)")
+        assert isinstance(got, int) and got >= 0
+
+    print("\n=== reserve_for_round: the flat 0.5 reserve, made round-aware ===\n")
+    for r in (1, 5, 8, 10):
+        print(f"  round {r:>2} -> reserve {reserve_for_round(r):.2f} of the pool")
+    assert reserve_for_round(1) == 0.45
+    assert reserve_for_round(10) == 0.0
+    assert reserve_for_round(1) > reserve_for_round(5) > reserve_for_round(10)
+    # Nonsense round numbers are clamped, never raised on.
+    assert 0.0 <= reserve_for_round(-3) <= 1.0 and 0.0 <= reserve_for_round(99) <= 1.0
+    assert sum(ROUND_ALLOWANCE.values()) == 100, sum(ROUND_ALLOWANCE.values())
+    assert ROUND_ALLOWANCE[10] > ROUND_ALLOWANCE[1], "late rounds are worth 1.5x — budget for them"
+
     print("\n=== BudgetPacer: disciplined-at-the-CEILING barely lasts the duel; careless does not ===\n")
     disciplined_pacer = BudgetPacer()
     for round_no in range(1, ROUNDS_PER_DUEL + 1):
@@ -404,18 +655,20 @@ if __name__ == "__main__":
         f"  disciplined (ceiling, {disciplined}cr) x10 rounds -> spent={disciplined_pacer.credits_spent} "
         f"credits_left={disciplined_pacer.credits_left} bankrupt_by={disciplined_pacer.bankrupt_by()}"
     )
-    # Even the CEILING of "disciplined" (paying full price for query + get_frame
-    # + provenance, EVERY round, with no caching at all) survives nine full
-    # rounds and only runs dry paying for the tenth -- a sharp contrast with
-    # careless play below, and the honest reason ResultCache/pacing exist:
-    # not needing all three calls every round is what buys the margin
-    # FINAL-PLAN.md 4.3 calls "sustainable".
-    assert disciplined_pacer.bankrupt_by() == ROUNDS_PER_DUEL, disciplined_pacer.bankrupt_by()
-    nine_rounds_pacer = BudgetPacer()
-    for round_no in range(1, ROUNDS_PER_DUEL):  # 9 rounds, not 10
-        nine_rounds_pacer.record_spend(round_no, disciplined)
-    print(f"  disciplined (ceiling) x9 rounds  -> credits_left={nine_rounds_pacer.credits_left} (still positive)")
-    assert nine_rounds_pacer.credits_left >= 0
+    # The CEILING of "disciplined" (paying full price for query + get_frame +
+    # provenance, EVERY round, with no caching at all) finishes all ten rounds
+    # with a single-digit margin -- a sharp contrast with careless play below,
+    # and the honest reason ResultCache/pacing still exist: that margin does
+    # not absorb one catalog read (12 cr), let alone two.
+    assert disciplined_pacer.bankrupt_by() is None, disciplined_pacer.bankrupt_by()
+    assert 0 < disciplined_pacer.credits_left <= 12, disciplined_pacer.credits_left
+    one_catalog_read = BudgetPacer()
+    for round_no in range(1, ROUNDS_PER_DUEL + 1):
+        one_catalog_read.record_spend(round_no, disciplined)
+    one_catalog_read.record_spend(ROUNDS_PER_DUEL, estimated_cost("registry", "list_servers", ()))
+    print(f"  ...plus ONE default-mask registry.list_servers -> credits_left="
+          f"{one_catalog_read.credits_left} bankrupt_by={one_catalog_read.bankrupt_by()}")
+    assert one_catalog_read.credits_left < 0, "one catalog read must be enough to break the margin"
 
     careless_pacer = BudgetPacer()
     bankrupt_round = None
@@ -438,6 +691,23 @@ if __name__ == "__main__":
     assert mid_pacer.is_affordable(2, -20) is True  # nonsense cost, but arithmetic still holds
     fresh_pacer = BudgetPacer()
     assert fresh_pacer.is_affordable(1, disciplined) is True
+
+    print("\n=== BudgetPacer + reserve_for_round: pacing that stops being timid late ===\n")
+    # The failure the flat reserve produces, shown side by side: 30 credits
+    # left in round 9 is ample for an 11-credit round with only two rounds to
+    # pay for, but a flat 0.5 floor refuses it — in exactly the rounds where a
+    # credit prevents 1.5x the damage it would have prevented in round 2.
+    late = BudgetPacer()
+    late.record_spend(1, 70)
+    flat = late.is_affordable(9, 11)
+    aware = late.is_affordable(9, 11, reserve=reserve_for_round(9))
+    print(f"  round 9, {late.credits_left} cr left, an 11 cr round:")
+    print(f"    flat reserve  (0.50) -> affordable={flat}   <- over-cautious, and it costs 1.5x")
+    print(f"    round-aware   ({reserve_for_round(9):.2f}) -> affordable={aware}")
+    assert flat is False and aware is True
+    # ...and it is still not a licence to be careless: the round-aware floor
+    # refuses a CARELESS round even in round 9.
+    assert late.is_affordable(9, careless, reserve=reserve_for_round(9)) is False
 
     print("\n=== pick_replica: the naive heuristic, and why it is naive ===\n")
     choice_clean = pick_replica(path_id="d8f95a7b", known_drifting=False)
